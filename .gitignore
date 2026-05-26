@@ -13,6 +13,7 @@ wheels/
 # Folders
 __marimo__/
 data/*
+.claude/
 
 # Files
 !.gitkeep
