@@ -1,7 +1,7 @@
 import marimo
 
 __generated_with = "0.23.6"
-app = marimo.App(width="full", app_title="GRU Korean Iron Regression")
+app = marimo.App(width="medium", app_title="GRU Korean Iron Regression")
 
 
 @app.cell
@@ -808,7 +808,7 @@ def _(go, jnp, train_history):
             y=jnp.mean(train_history[0].loss, axis=1),
             mode="lines",
             name="Training Loss",
-            line=dict(color="#378ADD", width=1.5),
+            # line=dict(color="#378ADD", width=1.5),
         )
     )
 
@@ -818,8 +818,8 @@ def _(go, jnp, train_history):
         xaxis_title="<b>Epoch</b>",
         yaxis_title="<b>Log Loss</b>",
         hovermode="x unified",
-        plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
+        # plot_bgcolor="rgba(0,0,0,0)",
+        # paper_bgcolor="rgba(0,0,0,0)",
     )
 
     fig2.show()

@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.23.6"
+__generated_with = "0.23.8"
 app = marimo.App(width="full", app_title="GRU Korean Iron Regression")
 
 
@@ -22,6 +22,12 @@ def _():
     from plotly.subplots import make_subplots
     from sklearn.compose import ColumnTransformer
     from sklearn.preprocessing import RobustScaler, MaxAbsScaler
+    from sklearn.metrics import (
+        r2_score,
+        mean_squared_error,
+        mean_absolute_error,
+        mean_absolute_percentage_error,
+    )
 
     return (
         Any,
@@ -33,11 +39,15 @@ def _():
         jax,
         jnp,
         make_subplots,
+        mean_absolute_error,
+        mean_squared_error,
         mo,
         np,
         optax,
         partial,
         pd,
+        r2_score,
+        tqdm,
     )
 
 
@@ -308,16 +318,30 @@ def _(go, y):
 @app.cell
 def _():
     # Initial Sizes
-    input_size = 12  # each timestep is ONE number (the count)
-    hidden_size = 16  # memory capacity — your choice
-    output_size = 1  # predicting ONE number (next month)
-    timesteps = 12  # window size — how far back you look
-    batch_size = 128  # batch size
-    return batch_size, hidden_size, input_size, output_size, timesteps
+    input_size: int = 12  # each timestep is ONE number (the count)
+    output_size: int = 1  # predicting ONE number (next month)
+    timesteps: int = 14  # window size — how far back you look
+    batch_size: int = 32  # batch size
+
+    # Attension Dimensions
+    head_dim: int = 8  # Dimensioun of the head
+    d_model: int = 32  # Model dimensions
+    n_heads: int = 4  # N Attension Heads
+    ffn_out_1: int = 128
+    return (
+        batch_size,
+        d_model,
+        ffn_out_1,
+        head_dim,
+        input_size,
+        n_heads,
+        output_size,
+        timesteps,
+    )
 
 
 @app.cell
-def _(jax, jnp):
+def _(jax, jnp, partial):
     def stack_func(
         X: jax.Array,
         y: jax.Array,
@@ -359,6 +383,7 @@ def _(jax, jnp):
         )
 
 
+    @partial(jax.jit, static_argnames=["batch_size"])
     def permute_n_batch_func(
         X_stack: jax.Array,
         y_stack: jax.Array,
@@ -381,339 +406,7 @@ def _(jax, jnp):
 
 
 @app.cell
-def _(NamedTuple, jax, jnp):
-    class ModelWeights(NamedTuple):
-        # Reset Gate Weights
-        Wxr: jax.Array
-        Whr: jax.Array
-        br: jax.Array
-        # Update Gate Weights
-        Wxz: jax.Array
-        Whz: jax.Array
-        bz: jax.Array
-        # Candidate generate Weights
-        Wxh: jax.Array
-        Whh: jax.Array
-        bh: jax.Array
-        # Output Layer
-        Wy: jax.Array
-        by: jax.Array
-
-
-    def ortogonalize_matrix(W: jax.Array) -> jax.Array:
-        U, *_ = jnp.linalg.svd(W)
-        return U
-
-
-    def weights_init(
-        input_size: int,
-        hidden_size: int,
-        output_size: int,
-        key: jax.random.PRNGKey = jax.random.key(42),
-    ) -> ModelWeights:
-        # Key split
-        (
-            key_Wxr,
-            key_Whr,
-            key_Wxz,
-            key_Whz,
-            key_Wxh,
-            key_Whh,
-            key_Wy,
-        ) = jax.random.split(key, 7)
-
-        # Reset Weights Init
-        Wxr = (
-            jax.random.normal(key_Wxr, (input_size, hidden_size))
-            * jnp.sqrt(2 / (input_size + hidden_size))
-            * 0.1
-        )
-        Whr = ortogonalize_matrix(
-            jax.random.normal(key_Whr, (hidden_size, hidden_size))
-        )
-        br = jnp.zeros((hidden_size,))
-
-        # Update Weights Init
-        Wxz = (
-            jax.random.normal(key_Wxz, (input_size, hidden_size))
-            * jnp.sqrt(2 / (input_size + hidden_size))
-            * 0.1
-        )
-        Whz = ortogonalize_matrix(
-            jax.random.normal(key_Whz, (hidden_size, hidden_size))
-        )
-        bz = jnp.zeros((hidden_size,))
-
-        # Candidate Weights Init
-        Wxh = (
-            jax.random.normal(key_Wxh, (input_size, hidden_size))
-            * jnp.sqrt(2 / (input_size + hidden_size))
-            * 0.1
-        )
-        Whh = ortogonalize_matrix(
-            jax.random.normal(key_Whh, (hidden_size, hidden_size))
-        )
-        bh = jnp.zeros((hidden_size,))
-
-        # Output layer
-        Wy = (
-            jax.random.normal(key_Wy, (hidden_size, output_size))
-            * jnp.sqrt(2 / (hidden_size + output_size))
-            * 0.1
-        )
-        by = jnp.zeros((output_size,))
-
-        # Return Model Weights
-        return ModelWeights(
-            Wxr,
-            Whr,
-            br,
-            # Input Gate Weights
-            Wxz,
-            Whz,
-            bz,
-            # Output Gate Weights
-            Wxh,
-            Whh,
-            bh,
-            # Output Layer
-            Wy,
-            by,
-        )
-
-    return ModelWeights, weights_init
-
-
-@app.cell
-def _(ModelWeights, jax, jnp):
-    def gate_func(
-        Wx: jax.Array, Wh: jax.Array, b: jax.Array, X: jax.Array, h_tm1: jax.Array
-    ) -> jax.Array:
-        return jax.nn.sigmoid(
-            jnp.einsum("f,fh->h", X, Wx) + jnp.einsum("h,hi->i", h_tm1, Wh) + b
-        )
-
-
-    def candidate_func(
-        Wxh: jax.Array,
-        Whh: jax.Array,
-        bh: jax.Array,
-        X: jax.Array,
-        h_tm1: jax.Array,
-        reset_gate: jax.Array,
-    ) -> jax.Array:
-        return jax.nn.tanh(
-            jnp.einsum("f,fh->h", X, Wxh)
-            + jnp.einsum("h,hi->i", (reset_gate * h_tm1), Whh)
-            + bh
-        )
-
-
-    def hiddenstate_update_func(
-        update_gate: jax.Array, h_candidate: jax.Array, h_tm1: jax.Array
-    ) -> jax.Array:
-        return ((1 - update_gate) * h_tm1) + (update_gate * h_candidate)
-
-
-    def gru_cell(
-        weights: ModelWeights, X: jnp.array, h_tm1: jax.Array
-    ) -> tuple[jax.Array, jax.Array]:
-
-        # Reset Gate
-        reset_gate = gate_func(
-            Wx=weights.Wxr,
-            Wh=weights.Whr,
-            b=weights.br,
-            X=X,
-            h_tm1=h_tm1,
-        )
-        # Update Gate
-        update_gate = gate_func(
-            Wx=weights.Wxz,
-            Wh=weights.Whz,
-            b=weights.bz,
-            X=X,
-            h_tm1=h_tm1,
-        )
-
-        # Update candidate
-        h_candidate = candidate_func(
-            Wxh=weights.Wxh,
-            Whh=weights.Whh,
-            bh=weights.bh,
-            X=X,
-            h_tm1=h_tm1,
-            reset_gate=reset_gate,
-        )
-
-        # Get the Hidden state
-        h_t = hiddenstate_update_func(
-            update_gate=update_gate, h_candidate=h_candidate, h_tm1=h_tm1
-        )
-
-        # Return
-        return h_t, h_t
-
-
-    def output_functions(
-        Wy: jax.Array, by: jax.Array, h_t: jax.Array
-    ) -> jax.Array:
-        return jnp.einsum("h,ho->o", h_t, Wy) + by
-
-
-    def mse_loss(target: jax.Array, predict: jax.Array):
-        return jnp.mean(jnp.square(target - predict))
-
-    return gru_cell, mse_loss, output_functions
-
-
-@app.cell
-def _(ModelWeights, gru_cell, jax, jnp, mse_loss, output_functions):
-    def gru_predict(
-        weights: ModelWeights, X_t: jax.Array, hidden_size: int
-    ) -> jax.Array:
-        # The Initial_state of the H0
-        h_init = jnp.zeros((hidden_size,))
-
-        # Traverse the time step
-        h_final, _ = jax.lax.scan(
-            lambda h, X: gru_cell(weights=weights, h_tm1=h, X=X),
-            init=h_init,
-            xs=X_t,
-        )
-        # Call the output functions
-        y_t = output_functions(Wy=weights.Wy, by=weights.by, h_t=h_final)
-
-        # return pred
-        return y_t
-
-
-    def batch_predict(
-        weights: ModelWeights, X_b: jax.Array, hidden_size: int
-    ) -> jax.Array:
-        # Get prections in the batch
-        pred_batch = jax.vmap(gru_predict, in_axes=(None, 0, None))(
-            weights, X_b, hidden_size
-        )
-        # Return the data
-        return pred_batch
-
-
-    def forward(
-        weights: ModelWeights, X_b: jax.Array, y_b: jax.Array, hidden_size: int
-    ):
-        # Get predictions
-        pred_b = batch_predict(weights=weights, X_b=X_b, hidden_size=hidden_size)
-
-        # Loss Functions
-        return mse_loss(predict=pred_b, target=y_b), pred_b
-
-    return forward, gru_predict
-
-
-@app.cell
-def _(
-    Any,
-    ModelWeights,
-    NamedTuple,
-    forward,
-    jax,
-    optax,
-    partial,
-    permute_n_batch_func,
-):
-    class TrainState(NamedTuple):
-        weights: ModelWeights
-        opt_state: Any
-
-
-    class EpochTrainState(NamedTuple):
-        train_state: TrainState
-        key_permute: jax.random.PRNGKey
-
-
-    class TrainHistory(NamedTuple):
-        loss: jax.Array
-        pred: jax.Array
-
-
-    def get_batch_train_step(optimizer):
-
-        def batch_train_step(
-            train_state: TrainState,
-            DS_b: tuple[jax.Array, jax.Array],
-            hidden_size: int,
-        ):
-            # Extract the value
-            X_b, y_b = DS_b
-
-            # Extract form trian state
-            weights, opt_state = train_state
-
-            # Get Loss, Grad & predictions
-            (loss, pred), grads = jax.value_and_grad(forward, has_aux=True)(
-                weights, X_b=X_b, y_b=y_b, hidden_size=hidden_size
-            )
-
-            # Udate step and opt state
-            updates, opt_state = optimizer.update(grads, opt_state, params=weights)
-            weights = optax.apply_updates(weights, updates)
-
-            # Return the data
-            return TrainState(weights, opt_state), TrainHistory(loss, pred)
-
-        # Return callable
-        return batch_train_step
-
-
-    def get_epoch_train_step(optimizer):
-        # Get Train Functions
-        batch_train_step = get_batch_train_step(optimizer)
-
-        @partial(jax.jit, static_argnames=["batch_size", "hidden_size"])
-        def epoch_train_step(
-            epoch_train_state: EpochTrainState,
-            X_stack: jax.Array,
-            y_stack: jax.Array,
-            batch_size: int,
-            hidden_size: int,
-        ):
-            # Unpack the epoch trian state
-            train_state, key_permute = epoch_train_state
-
-            # Split the key
-            key_permute, _ = jax.random.split(key_permute, 2)
-
-            # Batch the data X: (batch_no, batch_size, time_step, output)
-            # Batch the data Y: (batch_no, batch_size, output)
-            X_batch, y_batch = permute_n_batch_func(
-                X_stack=X_stack,
-                y_stack=y_stack,
-                batch_size=batch_size,
-                key=key_permute,
-            )
-
-            # One Epoch Of Training
-            train_state, train_history = jax.lax.scan(
-                lambda train_state, DS_b: batch_train_step(
-                    train_state, DS_b=DS_b, hidden_size=hidden_size
-                ),
-                init=train_state,
-                xs=(X_batch, y_batch),
-            )
-
-            # New epoch state
-            epoch_train_state = EpochTrainState(train_state, key_permute)
-
-            return epoch_train_state, (train_history, y_batch)
-
-        return epoch_train_step
-
-    return EpochTrainState, TrainState, get_epoch_train_step
-
-
-@app.cell
-def _(X, stack_func, timesteps, y):
+def _(X, stack_func, timesteps: int, y):
     # Stack the data first
     X_stack, y_stack = stack_func(X=X, y=y, timesteps=timesteps)
 
@@ -733,74 +426,414 @@ def _(X, stack_func, timesteps, y):
 
 
 @app.cell
-def _(
-    EpochTrainState,
-    TrainState,
-    X_stack,
-    batch_size,
-    get_epoch_train_step,
-    hidden_size,
-    input_size,
-    jax,
-    optax,
-    output_size,
-    weights_init,
-    y_stack,
-):
-    # Controls
-    epoch = 200
-    key_permute = jax.random.key(3534)
+def _(NamedTuple, jax):
+    class ModelWeights(NamedTuple):
+        # Input Layer
+        Wi: jax.Array  # (input_size, d_model)
+        bi: jax.Array  # (d_model,)
 
-    # Get the model weights n bias
-    weights = weights_init(
-        input_size=input_size, hidden_size=hidden_size, output_size=output_size
-    )
+        # Attension Weights
+        W_Q: jax.Array
+        W_K: jax.Array
+        W_V: jax.Array
+        # output Weights
+        Wo: jax.Array
+        # FFN
+        W_ffn1: jax.Array
+        W_ffn2: jax.Array
+        b_ffn2: jax.Array
+        # Final Layer
+        W_final: jax.Array
+        b_final: jax.Array
 
-    # Set optimizer
-    optimizer = optax.adamw(learning_rate=1e-3)
-    # Get Optimizer states
-    opt_state = optimizer.init(weights)
-
-    # init train state
-    train_state = TrainState(weights, opt_state)
-    epoch_train_state = EpochTrainState(train_state, key_permute)
-
-    # Get Train Functions
-    epoch_train_step = get_epoch_train_step(optimizer)
-
-    # Loop thorgh the epoches
-    epoch_train_state, train_history = jax.lax.scan(
-        lambda epoch_train_state, _: epoch_train_step(
-            epoch_train_state,
-            X_stack=X_stack,
-            y_stack=y_stack,
-            batch_size=batch_size,
-            hidden_size=hidden_size,
-        ),
-        init=epoch_train_state,
-        length=epoch,
-    )
-
-    # Block the colde till oversion is cpmplete
-    losses = jax.block_until_ready(train_history[0].loss)
-    return epoch_train_state, losses
+    return (ModelWeights,)
 
 
 @app.cell
-def _(go, jnp, losses):
-    fig2 = go.Figure()
+def init_weights(ModelWeights, ffn_out_1: int, jax, jnp):
+    def init_weights(
+        key: jax.random.PRNGKey,
+        *,
+        input_size: int,
+        d_model: int,
+        n_heads: int,
+        head_dim: int,
+        output_size: int,
+    ) -> ModelWeights:
+        # Split Keys
+        (
+            key_w1,
+            key_wq,
+            key_wk,
+            key_wv,
+            key_wo,
+            key_wffn1,
+            key_wffn2,
+            key_Wfinal,
+        ) = jax.random.split(key, num=8)
 
-    fig2.add_trace(
+        # Init Weights
+        Wi = jax.random.normal(key_w1, (input_size, d_model)) * jnp.sqrt(
+            2 / (input_size + d_model)
+        )
+        bi = jnp.zeros((d_model,))
+
+        # Attention weights
+        W_Q = jax.random.normal(
+            key=key_wq, shape=(d_model, n_heads, head_dim)
+        ) * jnp.sqrt(2 / (d_model + (n_heads * head_dim)))
+        W_K = jax.random.normal(
+            key=key_wk, shape=(d_model, n_heads, head_dim)
+        ) * jnp.sqrt(2 / (d_model + (n_heads * head_dim)))
+        W_V = jax.random.normal(
+            key=key_wv, shape=(d_model, n_heads, head_dim)
+        ) * jnp.sqrt(2 / (d_model + (n_heads * head_dim)))
+
+        # The Out  weights
+        Wo = jax.random.normal(key_wo, (head_dim, n_heads, d_model)) * jnp.sqrt(
+            2 / (d_model + (n_heads * head_dim))
+        )
+
+        # FFN Layers
+        W_ffn1 = jax.random.normal(key_wffn1, (d_model, ffn_out_1)) * jnp.sqrt(
+            2 / (d_model + ffn_out_1)
+        )
+        W_ffn2 = jax.random.normal(key_wffn2, (ffn_out_1, d_model)) * jnp.sqrt(
+            2 / (ffn_out_1 + d_model)
+        )
+        b_ffn2 = jnp.zeros((d_model,))
+
+        # Final output
+        W_final = jax.random.normal(key_Wfinal, (d_model, output_size)) * jnp.sqrt(
+            2 / (d_model + output_size)
+        )
+        b_final = jnp.zeros((output_size,))
+
+        # Return the data
+        return ModelWeights(
+            Wi, bi, W_Q, W_K, W_V, Wo, W_ffn1, W_ffn2, b_ffn2, W_final, b_final
+        )
+
+
+    def positional_encoder(*, timesteps: int, d_model: int) -> jax.Array:
+        # The postion vector
+        pos = jnp.arange(timesteps)[:, None]
+
+        # The dimension Indices
+        i = jnp.arange(d_model)[None, :]
+
+        # Get the denominator
+        denominator = jnp.power(10_000, (2 * (i // 2)) / d_model)
+
+        # Get angles
+        angles = pos / denominator
+
+        # The Positional encoding
+        PE = jnp.where(i % 2 == 0, jnp.sin(angles), jnp.cos(angles))
+
+        # Return Positional Encoder
+        return PE
+
+    return init_weights, positional_encoder
+
+
+@app.cell
+def _(ModelWeights, jax, jnp):
+    def func_input_projection(
+        params: ModelWeights, X_input: jax.Array
+    ) -> jax.Array:
+        return jnp.einsum("tf, fb -> tb", X_input, params.Wi) + params.bi
+
+    return (func_input_projection,)
+
+
+@app.cell
+def _(ModelWeights, head_dim: int, jax, jnp):
+    def func_scaled_dot_prod_attension(
+        params: ModelWeights, X_proj: jax.Array
+    ) -> jax.Array:
+        # 1. Q, K & V Projections
+        Q = jnp.einsum("td, dhk -> thk", X_proj, params.W_Q)
+        K = jnp.einsum("td, dhk -> thk", X_proj, params.W_K)
+        V = jnp.einsum("td, dhk -> thk", X_proj, params.W_V)
+
+        # 2. Scores
+        scores = jnp.einsum("qhn, khn -> hqk", Q, K) / jnp.sqrt(head_dim)
+
+        # 3. Weights
+        weights = jax.nn.softmax(scores, axis=-1)
+
+        # 4. Weighted Sums
+        weighted_sums = jnp.einsum("htk, khn -> thn", weights, V)
+
+        # Return weighted Means
+        return weighted_sums
+
+
+    def func_output_projection(params: ModelWeights, weighted_sums: jax.Array):
+        # 5. Output pojections
+        return jnp.einsum("thn, nhd -> td", weighted_sums, params.Wo)
+
+
+    def func_residual(*, out: jax.Array, X_proj: jax.Array) -> jax.Array:
+        # 6. Residual
+        return out + X_proj
+
+
+    def func_layer_norm(z: jax.Array) -> jax.Array:
+        # 7. Layer Normalization
+        ## Layer Means and standard Deviation
+        layer_mean = jnp.mean(z, axis=-1, keepdims=True)
+        layer_std = jnp.std(z, axis=-1, keepdims=True)
+
+        ## Normaize the layers
+        z = (z - layer_mean) / jnp.maximum(layer_std, 1e-6)
+
+        ## Return Layers
+        return z
+
+
+    def func_ffn(model_weights: ModelWeights, z: jax.Array) -> jax.Array:
+        out1 = jax.nn.gelu(jnp.einsum("do, td -> to", model_weights.W_ffn1, z))
+        out2 = (
+            jnp.einsum("do, id -> io", model_weights.W_ffn2, out1)
+            + model_weights.b_ffn2
+        )
+        return out2
+
+
+    def func_multihead_attension(
+        params: ModelWeights, X_proj: jax.Array
+    ) -> jax.Array:
+        # Generate weighted Sums
+        weighted_sums = func_scaled_dot_prod_attension(
+            params=params, X_proj=X_proj
+        )
+        # Output projection
+        out = func_output_projection(params=params, weighted_sums=weighted_sums)
+
+        # Residual
+        X_proj = func_residual(out=out, X_proj=X_proj)
+
+        # Layer Normalization
+        X_proj = func_layer_norm(z=X_proj)
+
+        # Layer Normalization
+        return X_proj
+
+
+    def pred_layer(params: ModelWeights, X_proj: jax.Array) -> jax.Array:
+        y_pred = jnp.einsum("do, d -> o", params.W_final, X_proj)
+        return y_pred
+
+
+    def func_mse_loss(y_true: jax.Array, y_pred: jax.Array) -> jax.Array:
+        return jnp.mean(jnp.square(y_true - y_pred))
+
+    return (
+        func_ffn,
+        func_layer_norm,
+        func_mse_loss,
+        func_multihead_attension,
+        func_residual,
+        pred_layer,
+    )
+
+
+@app.cell
+def _(
+    Any,
+    ModelWeights,
+    NamedTuple,
+    func_ffn,
+    func_input_projection,
+    func_layer_norm,
+    func_mse_loss,
+    func_multihead_attension,
+    func_residual,
+    jax,
+    optax,
+    pred_layer,
+):
+    def predict(
+        params: ModelWeights,
+        X: jax.Array,
+        PE: jax.Array,
+    ):
+        # The Input Projection
+        X_proj = func_input_projection(params, X)
+
+        # Add projections added wtih Positional Encoding
+        X_proj = X_proj + PE
+
+        # Muti Head Attension
+        X_proj = func_multihead_attension(params, X_proj=X_proj)
+
+        # Residual And Layer Norm Again
+        X_proj = func_layer_norm(
+            func_residual(out=func_ffn(params, z=X_proj), X_proj=X_proj)
+        )
+
+        # Get predictions
+        y_pred = pred_layer(params, X_proj=X_proj[-1])
+
+        # Return
+        return y_pred
+
+
+    # Forward Function for Batch
+    func_predict_batch = jax.jit(jax.vmap(predict, in_axes=(None, 0, None)))
+
+
+    @jax.jit
+    def forward(
+        params: ModelWeights,
+        X: jax.Array,
+        y: jax.Array,
+        PE: jax.Array,
+    ) -> jax.Array:
+        # predict
+        y_pred = func_predict_batch(params, X, PE)
+        # loss values
+        loss = func_mse_loss(y_true=y, y_pred=y_pred)
+
+        # Return
+        return loss
+
+
+    # Grad of Forward Functions
+    gradint_forward = jax.value_and_grad(forward, has_aux=False)
+
+
+    class TrainState(NamedTuple):
+        params: jax.Array
+        opt_state: Any
+
+
+    def get_train_step(optimizer):
+        @jax.jit
+        def train_step(
+            params: ModelWeights,
+            DS: tuple[jax.Array, jax.Array],
+            PE: jax.Array,
+            opt_state: Any,
+        ) -> tuple[TrainState, jax.Array]:
+            # Split data aset
+            X_batch, y_batch = DS
+
+            # Loss & Grad Function
+            loss, grad = gradint_forward(params, X_batch, y_batch, PE)
+
+            # Optimizer update state
+            updates, opt_state = optimizer.update(grad, opt_state, params=params)
+            params = optax.apply_updates(params, updates)
+
+            # return
+            return TrainState(params, opt_state), loss
+
+        # Return Function
+        return train_step
+
+    return TrainState, get_train_step, predict
+
+
+@app.cell
+def _(
+    TrainState,
+    X_stack,
+    batch_size: int,
+    d_model: int,
+    get_train_step,
+    head_dim: int,
+    init_weights,
+    input_size: int,
+    jax,
+    jnp,
+    n_heads: int,
+    optax,
+    output_size: int,
+    permute_n_batch_func,
+    positional_encoder,
+    timesteps: int,
+    tqdm,
+    y_stack,
+):
+    # Hyper parameters
+    epoch: int = 150
+    learning_rate = 1e-3
+
+    # History
+    history = []
+
+    # Model Weights
+    params = init_weights(
+        jax.random.key(84),
+        input_size=input_size,
+        d_model=d_model,
+        n_heads=n_heads,
+        head_dim=head_dim,
+        output_size=output_size,
+    )
+
+    # Get Projection Vector
+    PE = positional_encoder(d_model=d_model, timesteps=timesteps)
+
+    # Optimizer
+    optimizer = optax.adamw(learning_rate=learning_rate)
+    opt_state = optimizer.init(params)
+
+    # Train Step Function
+    train_step = get_train_step(optimizer)
+    train_state = TrainState(params, opt_state)
+
+    # Int the Batch Keys
+    batch_key = jax.random.key(100)
+
+    for _ in tqdm(range(epoch)):
+        # split Keys
+        batch_key, _ = jax.random.split(batch_key)
+
+        # Key for spltting & new batch
+        X_batch, y_batch = permute_n_batch_func(
+            X_stack,
+            y_stack,
+            batch_size,
+            batch_key,
+        )
+
+        # The Train Step
+        train_state, loss = jax.lax.scan(
+            lambda carry, DS: train_step(carry.params, DS, PE, carry.opt_state),
+            init=train_state,
+            xs=(X_batch, y_batch),
+        )
+
+        # Update History
+        history.append(loss)
+
+    # Block till over
+    history = jnp.array(history)
+    _ = jax.block_until_ready(history)
+    return PE, history, train_state
+
+
+@app.cell
+def _(go, history):
+    _fig = go.Figure()
+
+    _fig.add_trace(
         go.Scatter(
-            y=jnp.mean(losses, axis=1),
+            y=history.mean(axis=1),
             mode="lines",
-            name="Training Loss",
+            name="MSE Training Loss",
             line=dict(color="#378ADD", width=1.5),
         )
     )
 
-    fig2.update_layout(
-        title=dict(text="<b>GRU Training Loss</b>", x=0.5, font={"size": 22}),
+    _fig.update_layout(
+        title=dict(
+            text="<b>Transformer Training Loss</b>", x=0.5, font={"size": 22}
+        ),
         xaxis_title="<b>Epoch</b>",
         yaxis_title="<b>MSE Loss</b>",
         hovermode="x unified",
@@ -808,52 +841,22 @@ def _(go, jnp, losses):
         paper_bgcolor="rgba(0,0,0,0)",
     )
 
-    fig2.show()
+    _fig.show()
     return
 
 
 @app.cell
-def _(
-    X_stack_test,
-    epoch_train_state,
-    gru_predict,
-    hidden_size,
-    jax,
-    y_stack_test,
-):
-    # Get couuurent predictions
-    y_pred = jax.vmap(gru_predict, in_axes=(None, 0, None))(
-        epoch_train_state[0].weights, X_stack_test, hidden_size
-    )
-
-    # The predictions
-    y_pred = y_pred.ravel()
+def _(PE, X_stack_test, go, jax, predict, train_state, y_stack_test):
+    # Get Predictions & True values flattened
+    y_pred = jax.vmap(predict, in_axes=(None, 0, None))(
+        train_state.params, X_stack_test, PE
+    ).ravel()
     y_true = y_stack_test.ravel()
-    return y_pred, y_true
 
-
-@app.cell
-def _(y_pred, y_true):
-    from sklearn.metrics import (
-        r2_score,
-        mean_squared_error,
-        mean_absolute_error,
-        mean_absolute_percentage_error,
-    )
-
-    # Regression Metrics
-    print(f"R2  = {r2_score(y_true=y_true, y_pred=y_pred)}")
-    print(f"MSE = {mean_squared_error(y_true=y_true, y_pred=y_pred)}")
-    print(f"MAE = {mean_absolute_error(y_true=y_true, y_pred=y_pred)}")
-    return
-
-
-@app.cell
-def _(go, y_pred, y_true):
     # Get Figure
-    fig3 = go.Figure()
+    _fig = go.Figure()
 
-    fig3.add_trace(
+    _fig.add_trace(
         go.Scatter(
             y=y_true,
             mode="lines",
@@ -862,7 +865,7 @@ def _(go, y_pred, y_true):
         )
     )
 
-    fig3.add_trace(
+    _fig.add_trace(
         go.Scatter(
             y=y_pred,
             mode="lines",
@@ -871,16 +874,27 @@ def _(go, y_pred, y_true):
         )
     )
 
-    fig3.update_layout(
+    _fig.update_layout(
         title=dict(
-            text="<b>GRU — Actual vs Predicted</b>", x=0.5, font={"size": 22}
+            text="<b>Transformers — Actual vs Predicted</b>",
+            x=0.5,
+            font={"size": 22},
         ),
         xaxis_title="<b>Step</b>",
         yaxis_title="<b>KWh Power Consumed</b>",
         hovermode="x unified",
     )
 
-    fig3.show()
+    _fig.show()
+    return y_pred, y_true
+
+
+@app.cell
+def _(mean_absolute_error, mean_squared_error, r2_score, y_pred, y_true):
+    # Regression Metrics
+    print(f"R2  = {r2_score(y_true=y_true, y_pred=y_pred)}")
+    print(f"MSE = {mean_squared_error(y_true=y_true, y_pred=y_pred)}")
+    print(f"MAE = {mean_absolute_error(y_true=y_true, y_pred=y_pred)}")
     return
 
 
