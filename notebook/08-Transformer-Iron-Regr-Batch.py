@@ -1,7 +1,7 @@
 import marimo
 
 __generated_with = "0.23.8"
-app = marimo.App(width="full", app_title="GRU Korean Iron Regression")
+app = marimo.App(app_title="GRU Korean Iron Regression")
 
 
 @app.cell
